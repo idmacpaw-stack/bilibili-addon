@@ -12,7 +12,7 @@ const ORIGIN = process.env.PUBLIC_URL || 'https://bilibili-addon.vercel.app';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.5.1',
+    version: '1.5.2',
     name: 'Bilibili TV Addon',
     description: 'Katalog dan streaming dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -184,8 +184,13 @@ async function fetchPlay(kind, num) {
         device: 'wap',
         tf: 0
     };
-    if (kind === 'av') params.aid = num;
-    else params.ep_id = num;
+    if (kind === 'av') {
+        params.aid = num;
+        params.spm_id = 'bstar-web.ugc-video-detail.0.0';
+        params.from_spm_id = '';
+    } else {
+        params.ep_id = num;
+    }
     const { data } = await http.get(`${BASE}/playurl`, { params });
     return data;
 }
@@ -356,22 +361,27 @@ app.get(/^\/dash\/(ep|av)\/(\d+)\.mpd$/, async (req, res) => {
 });
 
 
-// Coba satu video dengan beberapa locale / kualitas, laporkan kode tiap percobaan
+// Coba satu video dengan beberapa variasi parameter, laporkan kode tiap percobaan
 app.get('/debug/try/:kind/:num', wrap(async req => {
     const { kind, num } = req.params;
-    const combos = [];
-    for (const loc of ['en_US', 'id_ID', 'th_TH', 'vi_VN', 'ms_MY']) {
-        for (const qn of [64, 32]) combos.push({ loc, qn });
-    }
-    return Promise.all(combos.map(async ({ loc, qn }) => {
+    const idParam = kind === 'av' ? { aid: num } : { ep_id: num };
+    const base = { s_locale: 'en_US', platform: 'web', qn: 64, type: 0, device: 'wap', tf: 0, ...idParam };
+    const variants = {
+        'tanpa spm_id': {},
+        'spm ugc': { spm_id: 'bstar-web.ugc-video-detail.0.0', from_spm_id: '' },
+        'spm pgc': { spm_id: 'bstar-web.pgc-video-detail.0.0', from_spm_id: '' },
+        'spm ugc + from homepage': { spm_id: 'bstar-web.ugc-video-detail.0.0', from_spm_id: 'bstar-web.homepage.trending.all' },
+        'platform=h5': { platform: 'h5', spm_id: 'bstar-web.ugc-video-detail.0.0', from_spm_id: '' },
+        'tanpa device/type/tf': { device: undefined, type: undefined, tf: undefined, spm_id: 'bstar-web.ugc-video-detail.0.0' },
+        'qn=120': { qn: 120, spm_id: 'bstar-web.ugc-video-detail.0.0', from_spm_id: '' }
+    };
+    return Promise.all(Object.entries(variants).map(async ([name, extra]) => {
         try {
-            const params = { s_locale: loc, platform: 'web', qn, type: 0, device: 'wap', tf: 0 };
-            if (kind === 'av') params.aid = num; else params.ep_id = num;
-            const r = await http.get(`${BASE}/playurl`, { params, validateStatus: () => true });
+            const r = await http.get(`${BASE}/playurl`, { params: { ...base, ...extra }, validateStatus: () => true });
             const d = r.data || {};
-            return { loc, qn, http: r.status, code: d.code, message: d.message, hasVideo: !!(d.data && d.data.playurl && d.data.playurl.video) };
+            return { variasi: name, http: r.status, code: d.code, message: d.message, hasVideo: !!(d.data && d.data.playurl && d.data.playurl.video) };
         } catch (e) {
-            return { loc, qn, error: e.message };
+            return { variasi: name, error: e.message };
         }
     }));
 }));
