@@ -10,7 +10,7 @@ const LOCALE = 'en_US';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.2.2',
+    version: '1.3.0',
     name: 'Bilibili TV Addon',
     description: 'Katalog dan streaming dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -38,9 +38,11 @@ function parseId(id) {
     return m ? { kind: m[1], num: m[2] } : null;
 }
 
-async function searchBili(keyword) {
-    const { data } = await http.get(`${BASE}/v2/search`, {
-        params: { keyword, s_locale: LOCALE, platform: 'web' }
+const PAGE_SIZE = 20;
+
+async function searchBili(keyword, page = 1) {
+    const { data } = await http.get(`${BASE}/v2/search_v2`, {
+        params: { keyword, s_locale: LOCALE, platform: 'web', pn: page, ps: PAGE_SIZE }
     });
     return data;
 }
@@ -69,6 +71,7 @@ function collectItems(node, out, seen) {
             posterShape: 'poster',
             description: node.intro || node.desc || node.subtitle || ''
         });
+        return;
     }
     Object.values(node).forEach(v => collectItems(v, out, seen));
 }
@@ -76,14 +79,14 @@ function collectItems(node, out, seen) {
 builder.defineCatalogHandler(async (args) => {
     try {
         const extra = (args && args.extra) || {};
-        if (parseInt(extra.skip, 10) > 0) return { metas: [] };
-
+        const skip = parseInt(extra.skip, 10) || 0;
+        const page = Math.floor(skip / PAGE_SIZE) + 1;
         const keyword = extra.search && extra.search.trim() ? extra.search.trim() : 'anime';
-        const data = await searchBili(keyword);
 
+        const data = await searchBili(keyword, page);
         const metas = [];
         collectItems(data && data.data, metas, new Set());
-        return { metas: metas.slice(0, 50), cacheMaxAge: 900 };
+        return { metas, cacheMaxAge: 900 };
     } catch (err) {
         console.error('catalog error:', err.message);
         return { metas: [] };
@@ -186,7 +189,7 @@ const wrap = fn => async (req, res) => {
 };
 
 app.get('/debug/search', wrap(async req => {
-    const data = await searchBili(req.query.q || 'anime');
+    const data = await searchBili(req.query.q || 'anime', 1);
     const metas = [];
     collectItems(data && data.data, metas, new Set());
     return {
@@ -210,70 +213,6 @@ app.get('/debug/play/:kind/:num', wrap(async req => {
     };
 }));
 
-
-// Mencoba beberapa kemungkinan alamat sekaligus, melaporkan status tiap alamat
-app.get('/debug/probe', wrap(async req => {
-    const kw = encodeURIComponent(req.query.q || 'anime');
-    const loc = 's_locale=en_US';
-    const candidates = [
-        'https://api.bilibili.tv/',
-        `${BASE}/v2/search?keyword=${kw}&${loc}&platform=web`,
-        `${BASE}/v2/search_v2?keyword=${kw}&${loc}&platform=web`,
-        `${BASE}/v2/search/all?keyword=${kw}&${loc}&platform=web`,
-        `${BASE}/v2/search/result?keyword=${kw}&${loc}&platform=web`,
-        `${BASE}/search?keyword=${kw}&${loc}&platform=web`,
-        `https://api.bilibili.tv/intl/gateway/v2/app/search/v2?keyword=${kw}&${loc}&platform=android&mobi_app=bstar_a`,
-        `https://api.bilibili.tv/intl/gateway/v2/app/search/type?keyword=${kw}&${loc}&platform=android&mobi_app=bstar_a`,
-        `${BASE}/v2/user/follow/modify?${loc}&platform=web`,
-        `${BASE}/v2/ogv/play/episodes?season_id=34661&${loc}&platform=web`,
-        `${BASE}/playurl?aid=1&${loc}&platform=web&qn=64&type=0&device=wap&tf=0`
-    ];
-    const results = await Promise.all(candidates.map(async url => {
-        try {
-            const r = await http.get(url, { validateStatus: () => true, timeout: 6000 });
-            const body = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
-            return { url: url.replace('https://api.bilibili.tv', ''), status: r.status, body: body.slice(0, 160) };
-        } catch (e) {
-            return { url: url.replace('https://api.bilibili.tv', ''), error: e.message };
-        }
-    }));
-    return results;
-}));
-
-
-// Probe tahap 2: kombinasi parameter search_v2 + alamat daftar anime
-app.get('/debug/probe2', wrap(async req => {
-    const kw = encodeURIComponent(req.query.q || 'anime');
-    const b = `${BASE}/v2/search_v2?keyword=${kw}&s_locale=en_US&platform=web`;
-    const stats = encodeURIComponent(JSON.stringify({ appId: 5, platform: 5, version: '1.0.0', abtest: '' }));
-    const candidates = [
-        `${b}&limit=20`,
-        `${b}&pn=1&ps=20`,
-        `${b}&page=1&page_size=20`,
-        `${b}&limit=20&pn=1`,
-        `${b}&limit=20&pn=1&type=0`,
-        `${b}&statistics=${stats}`,
-        `${b}&limit=20&pn=1&statistics=${stats}&from_spm_id=bstar-web.homepage.0.0&spm_id=bstar-web.search-result.0.0`,
-        `${b}&lang_id=1&limit=20&pn=1`,
-        `${BASE}/v2/search_v2?keyword=${kw}&s_locale=en_US`,
-        `${BASE}/v2/search/suggest?keyword=${kw}&s_locale=en_US&platform=web`,
-        `${BASE}/v2/ogv/timeline?s_locale=en_US&platform=web`,
-        `${BASE}/v2/ogv/index/condition?s_locale=en_US&platform=web`,
-        `${BASE}/v2/ogv/index/result?s_locale=en_US&platform=web&page=1&page_size=20`,
-        `${BASE}/v2/ogv/rank?s_locale=en_US&platform=web`,
-        `${BASE}/v2/anime?s_locale=en_US&platform=web`,
-        `${BASE}/v2/home?s_locale=en_US&platform=web`
-    ];
-    return Promise.all(candidates.map(async url => {
-        try {
-            const r = await http.get(url, { validateStatus: () => true, timeout: 6000 });
-            const body = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
-            return { url: url.replace(BASE, '').replace(stats, '<stats>'), status: r.status, body: body.slice(0, 220) };
-        } catch (e) {
-            return { url: url.replace(BASE, ''), error: e.message };
-        }
-    }));
-}));
 
 app.get('/', (req, res) => res.redirect('/manifest.json'));
 app.use('/', getRouter(builder.getInterface()));
