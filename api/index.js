@@ -12,7 +12,7 @@ const ORIGIN = process.env.PUBLIC_URL || 'https://bilibili-addon.vercel.app';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.5.2',
+    version: '1.6.0',
     name: 'Bilibili TV Addon',
     description: 'Katalog dan streaming dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -197,29 +197,45 @@ async function fetchPlay(kind, num) {
 
 const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-// Membuat manifest DASH (.mpd) yang menggabungkan video + audio Bilibili
-function buildMpd(data) {
-    const pu = data && data.data && data.data.playurl;
-    if (!pu || !Array.isArray(pu.video)) return null;
+// Cache link putar per instance (link Bilibili terikat ke IP server yang memintanya,
+// jadi permintaan video harus lewat instance yang sama)
+const playCache = new Map();
+async function cachedPlay(kind, num) {
+    const key = `${kind}:${num}`;
+    const hit = playCache.get(key);
+    if (hit && Date.now() - hit.t < 4 * 60 * 1000) return hit.data;
+    const data = await fetchPlay(kind, num);
+    if (data && data.code === 0) playCache.set(key, { t: Date.now(), data });
+    return data;
+}
 
+function pickTracks(data) {
+    const pu = data && data.data && data.data.playurl;
+    if (!pu || !Array.isArray(pu.video)) return { pu: null, videos: [], audios: [] };
     const videos = pu.video
         .map(v => v.video_resource)
         .filter(r => r && r.url && r.segment_base && /avc1/.test(r.codecs || ''));
     const audios = (Array.isArray(pu.audio_resource) ? pu.audio_resource : [])
         .filter(r => r && r.url && r.segment_base);
-    if (!videos.length || !audios.length) return null;
+    return { pu, videos, audios };
+}
+
+// Membuat manifest DASH (.mpd). Video/audio diambil lewat proxy /media milik addon ini.
+function buildMpd(data, kind, num) {
+    const { pu, videos, audios } = pickTracks(data);
+    if (!pu || !videos.length || !audios.length) return null;
 
     const dur = ((pu.duration || 0) / 1000).toFixed(3);
-    const rep = (r, id, extra) => `
+    const rep = (r, id, path, extra) => `
       <Representation id="${id}" bandwidth="${r.bandwidth || 0}" codecs="${esc(r.codecs || '')}"${extra}>
-        <BaseURL>${esc(r.url)}</BaseURL>
+        <BaseURL>${esc(`${ORIGIN}/media/${kind}/${num}/${path}.m4s`)}</BaseURL>
         <SegmentBase indexRange="${esc(r.segment_base.index_range)}"><Initialization range="${esc(r.segment_base.range)}"/></SegmentBase>
       </Representation>`;
 
     const vReps = videos.map((r, i) =>
-        rep(r, `v${i}`, ` width="${r.width || 0}" height="${r.height || 0}"${r.frame_rate ? ` frameRate="${esc(r.frame_rate)}"` : ''}`)
+        rep(r, `v${i}`, `v${i}`, ` width="${r.width || 0}" height="${r.height || 0}"${r.frame_rate ? ` frameRate="${esc(r.frame_rate)}"` : ''}`)
     ).join('');
-    const aReps = audios.map((r, i) => rep(r, `a${i}`, '')).join('');
+    const aReps = audios.map((r, i) => rep(r, `a${i}`, `a${i}`, '')).join('');
 
     return `<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="PT${dur}S" minBufferTime="PT2S">
@@ -242,7 +258,7 @@ function extractStreams(data, kind, num) {
     if (!pu || !Array.isArray(pu.video)) return streams;
 
     // Pilihan 1: DASH (video + audio) lewat manifest buatan sendiri
-    if (kind && num && buildMpd(data)) {
+    if (kind && num && buildMpd(data, kind, num)) {
         streams.push({
             name: 'Bilibili',
             title: 'DASH (video + suara)',
@@ -346,11 +362,12 @@ app.get('/debug/season/:id', wrap(async req => {
 }));
 
 
-// Manifest DASH yang dibuat saat diminta (link Bilibili bersifat sementara)
+// Manifest DASH yang dibuat saat diminta
 app.get(/^\/dash\/(ep|av)\/(\d+)\.mpd$/, async (req, res) => {
     try {
-        const data = await fetchPlay(req.params[0], req.params[1]);
-        const mpd = buildMpd(data);
+        const [kind, num] = [req.params[0], req.params[1]];
+        const data = await cachedPlay(kind, num);
+        const mpd = buildMpd(data, kind, num);
         if (!mpd) return res.status(404).send('Stream DASH tidak tersedia');
         res.set('Content-Type', 'application/dash+xml');
         res.set('Cache-Control', 'no-store');
@@ -360,30 +377,54 @@ app.get(/^\/dash\/(ep|av)\/(\d+)\.mpd$/, async (req, res) => {
     }
 });
 
+// Proxy video/audio: server addon mengambil dari CDN Bilibili (dengan Referer + Range) lalu meneruskannya
+app.get(/^\/media\/(ep|av)\/(\d+)\/([va])(\d+)\.m4s$/, async (req, res) => {
+    try {
+        const [kind, num, type, idx] = [req.params[0], req.params[1], req.params[2], parseInt(req.params[3], 10)];
+        let data = await cachedPlay(kind, num);
+        let { videos, audios } = pickTracks(data);
+        const track = (type === 'v' ? videos : audios)[idx];
+        if (!track) return res.status(404).send('Track tidak ditemukan');
 
-// Coba satu video dengan beberapa variasi parameter, laporkan kode tiap percobaan
-app.get('/debug/try/:kind/:num', wrap(async req => {
-    const { kind, num } = req.params;
-    const idParam = kind === 'av' ? { aid: num } : { ep_id: num };
-    const base = { s_locale: 'en_US', platform: 'web', qn: 64, type: 0, device: 'wap', tf: 0, ...idParam };
-    const variants = {
-        'tanpa spm_id': {},
-        'spm ugc': { spm_id: 'bstar-web.ugc-video-detail.0.0', from_spm_id: '' },
-        'spm pgc': { spm_id: 'bstar-web.pgc-video-detail.0.0', from_spm_id: '' },
-        'spm ugc + from homepage': { spm_id: 'bstar-web.ugc-video-detail.0.0', from_spm_id: 'bstar-web.homepage.trending.all' },
-        'platform=h5': { platform: 'h5', spm_id: 'bstar-web.ugc-video-detail.0.0', from_spm_id: '' },
-        'tanpa device/type/tf': { device: undefined, type: undefined, tf: undefined, spm_id: 'bstar-web.ugc-video-detail.0.0' },
-        'qn=120': { qn: 120, spm_id: 'bstar-web.ugc-video-detail.0.0', from_spm_id: '' }
-    };
-    return Promise.all(Object.entries(variants).map(async ([name, extra]) => {
-        try {
-            const r = await http.get(`${BASE}/playurl`, { params: { ...base, ...extra }, validateStatus: () => true });
-            const d = r.data || {};
-            return { variasi: name, http: r.status, code: d.code, message: d.message, hasVideo: !!(d.data && d.data.playurl && d.data.playurl.video) };
-        } catch (e) {
-            return { variasi: name, error: e.message };
+        const headers = { 'User-Agent': UA, Referer: 'https://www.bilibili.tv/', Origin: 'https://www.bilibili.tv' };
+        if (req.headers.range) headers.Range = req.headers.range;
+
+        const up = await axios.get(track.url, {
+            responseType: 'stream',
+            headers,
+            validateStatus: () => true,
+            timeout: 20000
+        });
+        res.status(up.status);
+        for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+            if (up.headers[h]) res.set(h, up.headers[h]);
         }
-    }));
+        if (!up.headers['accept-ranges']) res.set('Accept-Ranges', 'bytes');
+        res.set('Cache-Control', 'no-store');
+        req.on('close', () => up.data.destroy());
+        up.data.on('error', () => res.end());
+        up.data.pipe(res);
+    } catch (e) {
+        res.status(502).send('Gagal meneruskan video: ' + e.message);
+    }
+});
+
+// Cek apakah server bisa mengambil potongan video dari CDN Bilibili
+app.get('/debug/media/:kind/:num', wrap(async req => {
+    const data = await cachedPlay(req.params.kind, req.params.num);
+    const { videos, audios } = pickTracks(data);
+    const out = { videoTracks: videos.length, audioTracks: audios.length };
+    for (const [name, tr] of [['video0', videos[0]], ['audio0', audios[0]]]) {
+        if (!tr) { out[name] = 'tidak ada'; continue; }
+        const r = await axios.get(tr.url, {
+            headers: { 'User-Agent': UA, Referer: 'https://www.bilibili.tv/', Range: 'bytes=0-99' },
+            responseType: 'arraybuffer',
+            validateStatus: () => true,
+            timeout: 8000
+        });
+        out[name] = { status: r.status, contentType: r.headers['content-type'], contentRange: r.headers['content-range'], bytes: r.data ? r.data.length : 0 };
+    }
+    return out;
 }));
 
 app.get('/', (req, res) => res.redirect('/manifest.json'));
