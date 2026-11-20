@@ -10,30 +10,29 @@ const LOCALE = 'en_US';
 const PAGE_SIZE = 20;
 const ORIGIN = process.env.PUBLIC_URL || 'https://bilibili-addon.vercel.app';
 
+const GENRES = ['Action', 'Romance', 'Comedy', 'Fantasy', 'Isekai', 'Slice of Life', 'Sports', 'Mystery', 'Horror', 'Donghua'];
+
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.6.0',
+    version: '1.7.0',
     name: 'Bilibili TV Addon',
-    description: 'Katalog dan streaming dari Bilibili.tv',
+    description: 'Anime dan series dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
-    types: ['movie', 'series'],
+    types: ['series'],
     catalogs: [
         {
             type: 'series',
-            id: 'bili_series',
-            name: 'Bilibili - Series / Anime',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            id: 'bili_airing',
+            name: 'Bilibili - Sedang Tayang',
+            extra: []
         },
         {
-            type: 'movie',
-            id: 'bili_trending',
-            name: 'Bilibili - Videos',
+            type: 'series',
+            id: 'bili_series',
+            name: 'Bilibili - Anime',
             extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
+                { name: 'genre', options: GENRES, isRequired: false },
+                { name: 'search', isRequired: false }
             ]
         }
     ],
@@ -92,22 +91,46 @@ function collectItems(node, out, seen) {
     Object.values(node).forEach(v => collectItems(v, out, seen));
 }
 
+async function fetchTimeline() {
+    const { data } = await http.get(`${BASE}/v2/ogv/timeline`, {
+        params: { s_locale: LOCALE, platform: 'web' }
+    });
+    return data;
+}
+
+// Cari beberapa kata kunci x beberapa halaman sekaligus, ambil hanya yang berjenis series
+async function seriesFromSearch(keywords, pages) {
+    const jobs = [];
+    for (const k of keywords) for (const pg of pages) jobs.push(searchBili(k, pg).catch(() => null));
+    const results = await Promise.all(jobs);
+    const all = [];
+    const seen = new Set();
+    for (const r of results) collectItems(r && r.data, all, seen);
+    return all.filter(m => m.type === 'series');
+}
+
 builder.defineCatalogHandler(async (args) => {
     try {
         const extra = (args && args.extra) || {};
-        const skip = parseInt(extra.skip, 10) || 0;
-        const page = Math.floor(skip / PAGE_SIZE) + 1;
-        const keyword = extra.search && extra.search.trim() ? extra.search.trim() : 'anime';
+        // Daftar dibuat sekali jalan, jadi halaman berikutnya dikosongkan
+        if (parseInt(extra.skip, 10) > 0) return { metas: [] };
 
-        const data = await searchBili(keyword, page);
-        const all = [];
-        collectItems(data && data.data, all, new Set());
+        let items = [];
+        if (args.id === 'bili_airing') {
+            const data = await fetchTimeline();
+            const all = [];
+            collectItems(data && data.data, all, new Set());
+            items = all.filter(m => m.type === 'series');
+        } else {
+            let keywords;
+            if (extra.search && extra.search.trim()) keywords = [extra.search.trim()];
+            else if (extra.genre) keywords = extra.genre === 'Donghua' ? ['donghua'] : [`${extra.genre} anime`, extra.genre];
+            else keywords = ['anime', 'donghua', 'anime season', 'episode 1 sub'];
+            items = await seriesFromSearch(keywords, [1, 2, 3]);
+        }
 
-        const wantSeries = args.type === 'series';
-        const metas = all
-            .filter(m => (wantSeries ? m.type === 'series' : m.type !== 'series'))
-            .map(m => ({ ...m, type: wantSeries ? 'series' : 'movie' }));
-        return { metas, cacheMaxAge: 900 };
+        const metas = items.map(m => ({ ...m, type: 'series' }));
+        return { metas, cacheMaxAge: 1800 };
     } catch (err) {
         console.error('catalog error:', err.message);
         return { metas: [] };
@@ -324,6 +347,24 @@ const wrap = fn => async (req, res) => {
         res.json({ error: e.message, status: e.response && e.response.status });
     }
 };
+
+app.get('/debug/timeline', wrap(async () => {
+    const data = await fetchTimeline();
+    const all = [];
+    collectItems(data && data.data, all, new Set());
+    const series = all.filter(m => m.type === 'series');
+    return { code: data && data.code, found: all.length, series: series.length, first: series.slice(0, 8).map(i => ({ id: i.id, name: i.name })) };
+}));
+
+app.get('/debug/series', wrap(async req => {
+    const kws = req.query.q ? [req.query.q] : ['anime', 'donghua', 'anime season', 'episode 1 sub'];
+    const out = {};
+    for (const k of kws) {
+        const items = await seriesFromSearch([k], [1, 2, 3]);
+        out[k] = { series: items.length, first: items.slice(0, 5).map(i => i.name) };
+    }
+    return out;
+}));
 
 app.get('/debug/search', wrap(async req => {
     const data = await searchBili(req.query.q || 'anime', 1);
