@@ -12,7 +12,7 @@ const ORIGIN = process.env.PUBLIC_URL || 'https://bilibili-addon.vercel.app';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.9.0',
+    version: '1.9.1',
     name: 'Bilibili TV Addon',
     description: 'Anime, series, dan film dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -407,6 +407,29 @@ const wrap = fn => async (req, res) => {
 };
 
 app.get('/debug/version', wrap(async () => ({ version: manifest.version })));
+
+// Probe endpoint Bilibili apa saja. Contoh:
+// /debug/get?path=/v2/ogv/season/index/result&season_type=1&pn=1&ps=20
+// Semua parameter selain "path" diteruskan ke Bilibili.
+app.get('/debug/get', wrap(async req => {
+    const { path, ...rest } = req.query;
+    if (!path || !String(path).startsWith('/')) return { error: 'isi ?path=/v2/...' };
+    const params = { s_locale: LOCALE, platform: 'web', ...rest };
+    const r = await http.get(`${BASE}${path}`, { params, validateStatus: () => true });
+    const data = r.data;
+    const items = [];
+    collectItems(data && data.data, items, new Set());
+    return {
+        httpStatus: r.status,
+        code: data && data.code,
+        message: data && data.message,
+        topKeys: data && data.data && typeof data.data === 'object' ? Object.keys(data.data) : [],
+        found: items.length,
+        series: items.filter(i => i.type === 'series').length,
+        first: items.slice(0, 8).map(i => ({ id: i.id, name: i.name })),
+        rawSample: JSON.stringify(data).slice(0, 800).replace(/https?:\/\/[^"]+/g, '[url]')
+    };
+}));
 
 app.get('/debug/timeline', wrap(async () => {
     const data = await fetchTimeline();
