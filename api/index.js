@@ -8,10 +8,11 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const HEADERS = { 'User-Agent': UA, Referer: 'https://www.bilibili.tv/', Origin: 'https://www.bilibili.tv' };
 const LOCALE = 'en_US';
 const PAGE_SIZE = 20;
+const ORIGIN = process.env.PUBLIC_URL || 'https://bilibili-addon.vercel.app';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.4.0',
+    version: '1.5.0',
     name: 'Bilibili TV Addon',
     description: 'Katalog dan streaming dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -189,7 +190,44 @@ async function fetchPlay(kind, num) {
     return data;
 }
 
-function extractStreams(data) {
+const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// Membuat manifest DASH (.mpd) yang menggabungkan video + audio Bilibili
+function buildMpd(data) {
+    const pu = data && data.data && data.data.playurl;
+    if (!pu || !Array.isArray(pu.video)) return null;
+
+    const videos = pu.video
+        .map(v => v.video_resource)
+        .filter(r => r && r.url && r.segment_base && /avc1/.test(r.codecs || ''));
+    const audios = (Array.isArray(pu.audio_resource) ? pu.audio_resource : [])
+        .filter(r => r && r.url && r.segment_base);
+    if (!videos.length || !audios.length) return null;
+
+    const dur = ((pu.duration || 0) / 1000).toFixed(3);
+    const rep = (r, id, extra) => `
+      <Representation id="${id}" bandwidth="${r.bandwidth || 0}" codecs="${esc(r.codecs || '')}"${extra}>
+        <BaseURL>${esc(r.url)}</BaseURL>
+        <SegmentBase indexRange="${esc(r.segment_base.index_range)}"><Initialization range="${esc(r.segment_base.range)}"/></SegmentBase>
+      </Representation>`;
+
+    const vReps = videos.map((r, i) =>
+        rep(r, `v${i}`, ` width="${r.width || 0}" height="${r.height || 0}"${r.frame_rate ? ` frameRate="${esc(r.frame_rate)}"` : ''}`)
+    ).join('');
+    const aReps = audios.map((r, i) => rep(r, `a${i}`, '')).join('');
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="PT${dur}S" minBufferTime="PT2S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">${vReps}
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" segmentAlignment="true" startWithSAP="1" lang="und">${aReps}
+    </AdaptationSet>
+  </Period>
+</MPD>`;
+}
+
+function extractStreams(data, kind, num) {
     const hints = {
         notWebReady: true,
         proxyHeaders: { request: { Referer: 'https://www.bilibili.tv/', 'User-Agent': UA } }
@@ -198,45 +236,57 @@ function extractStreams(data) {
     const streams = [];
     if (!pu || !Array.isArray(pu.video)) return streams;
 
+    // Pilihan 1: DASH (video + audio) lewat manifest buatan sendiri
+    if (kind && num && buildMpd(data)) {
+        streams.push({
+            name: 'Bilibili',
+            title: 'DASH (video + suara)',
+            url: `${ORIGIN}/dash/${kind}/${num}.mpd`,
+            behaviorHints: hints
+        });
+    }
+
+    // Pilihan berikutnya: video saja (tanpa suara)
+    const direct = [];
     for (const v of pu.video) {
         const r = v.video_resource;
         if (!r || !r.url) continue;
         const codec = String(r.codecs || '');
         const info = v.stream_info || {};
         const label = info.desc_words || info.display_desc || (r.height ? r.height + 'p' : 'Bilibili');
-        streams.push({
+        direct.push({
             name: 'Bilibili',
-            title: `${label}${codec ? ' • ' + codec.split('.')[0] : ''}`,
+            title: `${label}${codec ? ' • ' + codec.split('.')[0] : ''} • video saja`,
             url: r.url,
             behaviorHints: hints
         });
     }
-    streams.sort((a, b) => (/avc1/.test(b.title) ? 1 : 0) - (/avc1/.test(a.title) ? 1 : 0));
-    return streams;
+    direct.sort((a, b) => (/avc1/.test(b.title) ? 1 : 0) - (/avc1/.test(a.title) ? 1 : 0));
+    return streams.concat(direct);
 }
 
 async function resolveAndPlay(id) {
     const parsed = parseId(id);
-    if (!parsed) return { steps: ['id tidak dikenali'], data: null };
+    if (!parsed) return { steps: ['id tidak dikenali'], data: null, kind: null, num: null };
     const steps = [];
     let { kind, num } = parsed;
     if (kind === 'ss') {
         const { eps } = await fetchEpisodes(num);
         steps.push(`season ${num} punya ${eps.length} episode`);
-        if (!eps.length) return { steps, data: null };
+        if (!eps.length) return { steps, data: null, kind: null, num: null };
         kind = 'ep';
         num = String(eps[0].episode_id);
         steps.push(`memakai episode pertama ${num}`);
     }
     const data = await fetchPlay(kind, num);
     steps.push(`playurl code=${data && data.code} message=${data && data.message}`);
-    return { steps, data };
+    return { steps, data, kind, num };
 }
 
 builder.defineStreamHandler(async (args) => {
     try {
-        const { data } = await resolveAndPlay(args.id);
-        return { streams: extractStreams(data), cacheMaxAge: 300 };
+        const { data, kind, num } = await resolveAndPlay(args.id);
+        return { streams: extractStreams(data, kind, num), cacheMaxAge: 120 };
     } catch (err) {
         console.error('stream error:', err.message);
         return { streams: [] };
@@ -268,13 +318,14 @@ app.get('/debug/search', wrap(async req => {
 
 // Telusuri seluruh proses stream untuk satu ID, contoh: /debug/id/bili_ss_34661
 app.get('/debug/id/:id', wrap(async req => {
-    const { steps, data } = await resolveAndPlay(req.params.id);
-    const streams = extractStreams(data);
+    const { steps, data, kind, num } = await resolveAndPlay(req.params.id);
+    const streams = extractStreams(data, kind, num);
     const pu = data && data.data && data.data.playurl;
     return {
         steps,
         streamCount: streams.length,
         titles: streams.map(s => s.title),
+        dashUrl: kind && num ? `${ORIGIN}/dash/${kind}/${num}.mpd` : null,
         hasAudioResource: !!(pu && pu.audio_resource),
         rawSample: JSON.stringify(data).slice(0, 700).replace(/https?:\/\/[^"]+/g, '[url]')
     };
@@ -288,6 +339,21 @@ app.get('/debug/season/:id', wrap(async req => {
         rawSample: JSON.stringify(raw).slice(0, 500).replace(/https?:\/\/[^"]+/g, '[url]')
     };
 }));
+
+
+// Manifest DASH yang dibuat saat diminta (link Bilibili bersifat sementara)
+app.get(/^\/dash\/(ep|av)\/(\d+)\.mpd$/, async (req, res) => {
+    try {
+        const data = await fetchPlay(req.params[0], req.params[1]);
+        const mpd = buildMpd(data);
+        if (!mpd) return res.status(404).send('Stream DASH tidak tersedia');
+        res.set('Content-Type', 'application/dash+xml');
+        res.set('Cache-Control', 'no-store');
+        res.send(mpd);
+    } catch (e) {
+        res.status(502).send('Gagal mengambil data: ' + e.message);
+    }
+});
 
 app.get('/', (req, res) => res.redirect('/manifest.json'));
 app.use('/', getRouter(builder.getInterface()));
