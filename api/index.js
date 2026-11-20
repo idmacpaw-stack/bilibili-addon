@@ -10,7 +10,7 @@ const LOCALE = 'en_US';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.2.1',
+    version: '1.2.2',
     name: 'Bilibili TV Addon',
     description: 'Katalog dan streaming dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -238,6 +238,41 @@ app.get('/debug/probe', wrap(async req => {
         }
     }));
     return results;
+}));
+
+
+// Probe tahap 2: kombinasi parameter search_v2 + alamat daftar anime
+app.get('/debug/probe2', wrap(async req => {
+    const kw = encodeURIComponent(req.query.q || 'anime');
+    const b = `${BASE}/v2/search_v2?keyword=${kw}&s_locale=en_US&platform=web`;
+    const stats = encodeURIComponent(JSON.stringify({ appId: 5, platform: 5, version: '1.0.0', abtest: '' }));
+    const candidates = [
+        `${b}&limit=20`,
+        `${b}&pn=1&ps=20`,
+        `${b}&page=1&page_size=20`,
+        `${b}&limit=20&pn=1`,
+        `${b}&limit=20&pn=1&type=0`,
+        `${b}&statistics=${stats}`,
+        `${b}&limit=20&pn=1&statistics=${stats}&from_spm_id=bstar-web.homepage.0.0&spm_id=bstar-web.search-result.0.0`,
+        `${b}&lang_id=1&limit=20&pn=1`,
+        `${BASE}/v2/search_v2?keyword=${kw}&s_locale=en_US`,
+        `${BASE}/v2/search/suggest?keyword=${kw}&s_locale=en_US&platform=web`,
+        `${BASE}/v2/ogv/timeline?s_locale=en_US&platform=web`,
+        `${BASE}/v2/ogv/index/condition?s_locale=en_US&platform=web`,
+        `${BASE}/v2/ogv/index/result?s_locale=en_US&platform=web&page=1&page_size=20`,
+        `${BASE}/v2/ogv/rank?s_locale=en_US&platform=web`,
+        `${BASE}/v2/anime?s_locale=en_US&platform=web`,
+        `${BASE}/v2/home?s_locale=en_US&platform=web`
+    ];
+    return Promise.all(candidates.map(async url => {
+        try {
+            const r = await http.get(url, { validateStatus: () => true, timeout: 6000 });
+            const body = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+            return { url: url.replace(BASE, '').replace(stats, '<stats>'), status: r.status, body: body.slice(0, 220) };
+        } catch (e) {
+            return { url: url.replace(BASE, ''), error: e.message };
+        }
+    }));
 }));
 
 app.get('/', (req, res) => res.redirect('/manifest.json'));
