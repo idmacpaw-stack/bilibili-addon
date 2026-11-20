@@ -12,7 +12,7 @@ const ORIGIN = process.env.PUBLIC_URL || 'https://bilibili-addon.vercel.app';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.9.1',
+    version: '1.9.2',
     name: 'Bilibili TV Addon',
     description: 'Anime, series, dan film dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -429,6 +429,54 @@ app.get('/debug/get', wrap(async req => {
         first: items.slice(0, 8).map(i => ({ id: i.id, name: i.name })),
         rawSample: JSON.stringify(data).slice(0, 800).replace(/https?:\/\/[^"]+/g, '[url]')
     };
+}));
+
+// Coba banyak kandidat endpoint daftar anime sekaligus (sementara, untuk mencari sumber katalog)
+app.get('/debug/discover', wrap(async () => {
+    const WEB = BASE;
+    const APP = 'https://api.bilibili.tv/intl/gateway';
+    const std = { s_locale: LOCALE, platform: 'web' };
+    const idx = { ...std, season_type: 1, pn: 1, ps: 30, page: 1, page_size: 30, order: 0, area: -1, style_id: -1 };
+    const cands = [
+        ['web index/result', `${WEB}/v2/ogv/index/result`, idx],
+        ['web index_result', `${WEB}/v2/ogv/index_result`, idx],
+        ['web index/condition', `${WEB}/v2/ogv/index/condition`, std],
+        ['web season/index/result', `${WEB}/v2/ogv/season/index/result`, idx],
+        ['web v2/anime', `${WEB}/v2/anime`, idx],
+        ['web v2/anime/index', `${WEB}/v2/anime/index`, idx],
+        ['web ogv/anime', `${WEB}/v2/ogv/anime`, idx],
+        ['web ogv/rank', `${WEB}/v2/ogv/rank`, { ...std, season_type: 1 }],
+        ['web ogv/ranking', `${WEB}/v2/ogv/ranking`, { ...std, season_type: 1 }],
+        ['web ogv/hot', `${WEB}/v2/ogv/hot`, std],
+        ['web ogv/home', `${WEB}/v2/ogv/home`, std],
+        ['web ogv/recommend', `${WEB}/v2/ogv/recommend`, std],
+        ['web ogv/channel', `${WEB}/v2/ogv/channel`, std],
+        ['web home', `${WEB}/v2/home`, std],
+        ['web ogv/filter', `${WEB}/v2/ogv/filter`, idx],
+        ['web ogv/index', `${WEB}/v2/ogv/index`, idx],
+        ['app season/index/result', `${APP}/v2/ogv/season/index/result`, { ...idx, platform: 'android', build: 1080003 }],
+        ['app season/index/condition', `${APP}/v2/ogv/season/index/condition`, { ...std, platform: 'android', season_type: 1 }]
+    ];
+    const out = await Promise.all(cands.map(async ([label, url, params]) => {
+        try {
+            const r = await http.get(url, { params, validateStatus: () => true, timeout: 6000 });
+            const d = r.data;
+            const items = [];
+            if (d && typeof d === 'object') collectItems(d.data || d.result || d, items, new Set());
+            return {
+                label,
+                http: r.status,
+                code: d && d.code,
+                message: d && d.message,
+                found: items.length,
+                series: items.filter(i => i.type === 'series').length,
+                first: items.slice(0, 3).map(i => i.name)
+            };
+        } catch (e) {
+            return { label, error: e.message };
+        }
+    }));
+    return { results: out };
 }));
 
 app.get('/debug/timeline', wrap(async () => {
