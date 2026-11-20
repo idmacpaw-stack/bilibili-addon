@@ -10,15 +10,13 @@ const LOCALE = 'en_US';
 const PAGE_SIZE = 20;
 const ORIGIN = process.env.PUBLIC_URL || 'https://bilibili-addon.vercel.app';
 
-const GENRES = ['Action', 'Romance', 'Comedy', 'Fantasy', 'Isekai', 'Slice of Life', 'Sports', 'Mystery', 'Horror', 'Donghua'];
-
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.7.0',
+    version: '1.9.0',
     name: 'Bilibili TV Addon',
-    description: 'Anime dan series dari Bilibili.tv',
+    description: 'Anime, series, dan film dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
-    types: ['series'],
+    types: ['series', 'movie'],
     catalogs: [
         {
             type: 'series',
@@ -28,12 +26,15 @@ const manifest = {
         },
         {
             type: 'series',
-            id: 'bili_series',
-            name: 'Bilibili - Anime',
-            extra: [
-                { name: 'genre', options: GENRES, isRequired: false },
-                { name: 'search', isRequired: false }
-            ]
+            id: 'bili_popular',
+            name: 'Bilibili - Anime Populer',
+            extra: [{ name: 'search', isRequired: false }]
+        },
+        {
+            type: 'movie',
+            id: 'bili_movies',
+            name: 'Bilibili - Film Anime',
+            extra: []
         }
     ],
     idPrefixes: ['bili_']
@@ -45,9 +46,13 @@ const http = axios.create({ timeout: 7000, headers: HEADERS });
 // Cache sederhana (hanya hidup selama instance serverless masih aktif)
 const infoCache = new Map();
 
-// ID: bili_ep_123 (episode), bili_ss_123 (season/series), bili_av_123 (video biasa)
+// ID:
+//   bili_ep_123 = episode
+//   bili_ss_123 = season sebagai series
+//   bili_ms_123 = season sebagai film (movie)
+//   bili_av_123 = video unggahan pengguna
 function parseId(id) {
-    const m = /^bili_(ep|ss|av)_(\d+)$/.exec(id || '');
+    const m = /^bili_(ep|ss|ms|av)_(\d+)$/.exec(id || '');
     return m ? { kind: m[1], num: m[2] } : null;
 }
 
@@ -98,15 +103,62 @@ async function fetchTimeline() {
     return data;
 }
 
-// Cari beberapa kata kunci x beberapa halaman sekaligus, ambil hanya yang berjenis series
-async function seriesFromSearch(keywords, pages) {
-    const jobs = [];
-    for (const k of keywords) for (const pg of pages) jobs.push(searchBili(k, pg).catch(() => null));
-    const results = await Promise.all(jobs);
-    const all = [];
+// Pencarian Bilibili hanya memunculkan series kalau kata kunci cocok dengan judul,
+// jadi daftar dibuat dari pencarian judul terkenal satu per satu.
+const SERIES_SEEDS = [
+    'Naruto', 'One Piece', 'Detective Conan', 'Doraemon', 'Shin-chan', 'Demon Slayer', 'Jujutsu Kaisen',
+    'Attack on Titan', 'My Hero Academia', 'Spy x Family', 'Tokyo Revengers', 'Sword Art Online', 'Haikyuu',
+    'Fairy Tail', 'Black Clover', 'Dr. Stone', 'Re:Zero', 'Konosuba', 'Mushoku Tensei', 'Overlord',
+    'Bleach', 'Hunter x Hunter', 'Dragon Ball', 'Gintama', 'Chainsaw Man', 'Oshi no Ko', 'Frieren',
+    'Solo Leveling', 'Slime', 'Blue Lock', 'Vinland Saga', 'Gundam', 'Pokemon', 'Kaiju No. 8',
+    'Dandadan', 'Kimetsu', 'Boruto', 'Fate', 'Mashle', 'Classroom of the Elite',
+    'Mortal', 'Battle Through the Heavens', 'Soul Land', 'Perfect World', 'Tales of Herding Gods'
+];
+
+const MOVIE_SEEDS = [
+    'Your Name', 'Suzume', 'Weathering With You', 'Mugen Train', 'Jujutsu Kaisen 0', 'Spirited Away',
+    'One Piece Film', 'A Silent Voice', 'Violet Evergarden', 'Code White', 'The Boy and the Heron',
+    'Dragon Ball Super', 'Doraemon Movie', 'Stand by Me Doraemon', 'Detective Conan Movie', 'Look Back',
+    'Josee', 'Belle', 'Ne Zha', 'White Snake', 'Pokemon Movie', 'Gintama Movie', 'Naruto the Movie',
+    'Hunter x Hunter Movie', 'Chainsaw Man Reze', 'Haikyuu Movie', 'Fate Movie', 'Evangelion',
+    'Gundam Movie', 'Kimi no Na wa'
+];
+
+const norm = t => String(t).toLowerCase().replace(/[^a-z0-9]/g, '');
+const seedCache = {};
+
+function asMovie(m) {
+    const id = m.id.replace('bili_ss_', 'bili_ms_');
+    const item = { ...m, id, type: 'movie' };
+    infoCache.set(id, item);
+    return item;
+}
+
+async function seedItems(cacheKey, seeds, perSeed, movie) {
+    const hit = seedCache[cacheKey];
+    if (hit && Date.now() - hit.t < 3 * 3600 * 1000) return hit.items;
+    const items = [];
     const seen = new Set();
-    for (const r of results) collectItems(r && r.data, all, seen);
-    return all.filter(m => m.type === 'series');
+    const deadline = Date.now() + 40000;
+    for (let i = 0; i < seeds.length; i += 10) {
+        if (Date.now() > deadline) break;
+        const chunk = seeds.slice(i, i + 10);
+        const results = await Promise.all(chunk.map(k => searchBili(k, 1).catch(() => null)));
+        results.forEach((r, idx) => {
+            const key = norm(chunk[idx]);
+            const found = [];
+            collectItems(r && r.data, found, new Set());
+            found
+                .filter(m => m.type === 'series' && norm(m.name).includes(key))
+                .slice(0, perSeed)
+                .forEach(m => {
+                    const item = movie ? asMovie(m) : m;
+                    if (!seen.has(item.id)) { seen.add(item.id); items.push(item); }
+                });
+        });
+    }
+    if (items.length) seedCache[cacheKey] = { t: Date.now(), items };
+    return items;
 }
 
 builder.defineCatalogHandler(async (args) => {
@@ -116,20 +168,26 @@ builder.defineCatalogHandler(async (args) => {
         if (parseInt(extra.skip, 10) > 0) return { metas: [] };
 
         let items = [];
-        if (args.id === 'bili_airing') {
+        let type = 'series';
+        if (args.id === 'bili_movies') {
+            type = 'movie';
+            items = await seedItems('movies', MOVIE_SEEDS, 2, true);
+        } else if (args.id === 'bili_airing') {
             const data = await fetchTimeline();
             const all = [];
             collectItems(data && data.data, all, new Set());
             items = all.filter(m => m.type === 'series');
+        } else if (extra.search && extra.search.trim()) {
+            const results = await Promise.all([1, 2].map(pg => searchBili(extra.search.trim(), pg).catch(() => null)));
+            const all = [];
+            const seen = new Set();
+            results.forEach(r => collectItems(r && r.data, all, seen));
+            items = all.filter(m => m.type === 'series');
         } else {
-            let keywords;
-            if (extra.search && extra.search.trim()) keywords = [extra.search.trim()];
-            else if (extra.genre) keywords = extra.genre === 'Donghua' ? ['donghua'] : [`${extra.genre} anime`, extra.genre];
-            else keywords = ['anime', 'donghua', 'anime season', 'episode 1 sub'];
-            items = await seriesFromSearch(keywords, [1, 2, 3]);
+            items = await seedItems('series', SERIES_SEEDS, 3, false);
         }
 
-        const metas = items.map(m => ({ ...m, type: 'series' }));
+        const metas = items.map(m => ({ ...m, type }));
         return { metas, cacheMaxAge: 1800 };
     } catch (err) {
         console.error('catalog error:', err.message);
@@ -186,7 +244,7 @@ builder.defineMetaHandler(async (args) => {
             meta: {
                 id: args.id,
                 type: 'movie',
-                name: cached.name || 'Bilibili Video',
+                name: cached.name || 'Bilibili Film',
                 poster: cached.poster,
                 background: cached.poster,
                 description: cached.description || ''
@@ -314,7 +372,7 @@ async function resolveAndPlay(id) {
     if (!parsed) return { steps: ['id tidak dikenali'], data: null, kind: null, num: null };
     const steps = [];
     let { kind, num } = parsed;
-    if (kind === 'ss') {
+    if (kind === 'ss' || kind === 'ms') {
         const { eps } = await fetchEpisodes(num);
         steps.push(`season ${num} punya ${eps.length} episode`);
         if (!eps.length) return { steps, data: null, kind: null, num: null };
@@ -348,6 +406,8 @@ const wrap = fn => async (req, res) => {
     }
 };
 
+app.get('/debug/version', wrap(async () => ({ version: manifest.version })));
+
 app.get('/debug/timeline', wrap(async () => {
     const data = await fetchTimeline();
     const all = [];
@@ -356,14 +416,24 @@ app.get('/debug/timeline', wrap(async () => {
     return { code: data && data.code, found: all.length, series: series.length, first: series.slice(0, 8).map(i => ({ id: i.id, name: i.name })) };
 }));
 
-app.get('/debug/series', wrap(async req => {
-    const kws = req.query.q ? [req.query.q] : ['anime', 'donghua', 'anime season', 'episode 1 sub'];
-    const out = {};
-    for (const k of kws) {
-        const items = await seriesFromSearch([k], [1, 2, 3]);
-        out[k] = { series: items.length, first: items.slice(0, 5).map(i => i.name) };
-    }
-    return out;
+// Struktur mentah timeline, untuk melihat kenapa hanya sedikit judul yang terbaca
+app.get('/debug/timeline/raw', wrap(async () => {
+    const data = await fetchTimeline();
+    return {
+        code: data && data.code,
+        topKeys: data && data.data ? Object.keys(data.data) : [],
+        sample: JSON.stringify(data).slice(0, 2500).replace(/https?:\/\/[^"]+/g, '[url]')
+    };
+}));
+
+app.get('/debug/series', wrap(async () => {
+    const items = await seedItems('series', SERIES_SEEDS, 3, false);
+    return { total: items.length, first: items.slice(0, 15).map(i => ({ id: i.id, name: i.name })) };
+}));
+
+app.get('/debug/movies', wrap(async () => {
+    const items = await seedItems('movies', MOVIE_SEEDS, 2, true);
+    return { total: items.length, first: items.slice(0, 15).map(i => ({ id: i.id, name: i.name })) };
 }));
 
 app.get('/debug/search', wrap(async req => {
@@ -402,7 +472,6 @@ app.get('/debug/season/:id', wrap(async req => {
     };
 }));
 
-
 // Manifest DASH yang dibuat saat diminta
 app.get(/^\/dash\/(ep|av)\/(\d+)\.mpd$/, async (req, res) => {
     try {
@@ -422,8 +491,8 @@ app.get(/^\/dash\/(ep|av)\/(\d+)\.mpd$/, async (req, res) => {
 app.get(/^\/media\/(ep|av)\/(\d+)\/([va])(\d+)\.m4s$/, async (req, res) => {
     try {
         const [kind, num, type, idx] = [req.params[0], req.params[1], req.params[2], parseInt(req.params[3], 10)];
-        let data = await cachedPlay(kind, num);
-        let { videos, audios } = pickTracks(data);
+        const data = await cachedPlay(kind, num);
+        const { videos, audios } = pickTracks(data);
         const track = (type === 'v' ? videos : audios)[idx];
         if (!track) return res.status(404).send('Track tidak ditemukan');
 
