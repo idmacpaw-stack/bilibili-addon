@@ -10,7 +10,7 @@ const LOCALE = 'en_US';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.2.0',
+    version: '1.2.1',
     name: 'Bilibili TV Addon',
     description: 'Katalog dan streaming dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -208,6 +208,36 @@ app.get('/debug/play/:kind/:num', wrap(async req => {
         hasAudioResource: !!(data && data.data && data.data.playurl && data.data.playurl.audio_resource),
         rawSample: JSON.stringify(data).slice(0, 600).replace(/https?:\/\/[^"]+/g, '[url]')
     };
+}));
+
+
+// Mencoba beberapa kemungkinan alamat sekaligus, melaporkan status tiap alamat
+app.get('/debug/probe', wrap(async req => {
+    const kw = encodeURIComponent(req.query.q || 'anime');
+    const loc = 's_locale=en_US';
+    const candidates = [
+        'https://api.bilibili.tv/',
+        `${BASE}/v2/search?keyword=${kw}&${loc}&platform=web`,
+        `${BASE}/v2/search_v2?keyword=${kw}&${loc}&platform=web`,
+        `${BASE}/v2/search/all?keyword=${kw}&${loc}&platform=web`,
+        `${BASE}/v2/search/result?keyword=${kw}&${loc}&platform=web`,
+        `${BASE}/search?keyword=${kw}&${loc}&platform=web`,
+        `https://api.bilibili.tv/intl/gateway/v2/app/search/v2?keyword=${kw}&${loc}&platform=android&mobi_app=bstar_a`,
+        `https://api.bilibili.tv/intl/gateway/v2/app/search/type?keyword=${kw}&${loc}&platform=android&mobi_app=bstar_a`,
+        `${BASE}/v2/user/follow/modify?${loc}&platform=web`,
+        `${BASE}/v2/ogv/play/episodes?season_id=34661&${loc}&platform=web`,
+        `${BASE}/playurl?aid=1&${loc}&platform=web&qn=64&type=0&device=wap&tf=0`
+    ];
+    const results = await Promise.all(candidates.map(async url => {
+        try {
+            const r = await http.get(url, { validateStatus: () => true, timeout: 6000 });
+            const body = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+            return { url: url.replace('https://api.bilibili.tv', ''), status: r.status, body: body.slice(0, 160) };
+        } catch (e) {
+            return { url: url.replace('https://api.bilibili.tv', ''), error: e.message };
+        }
+    }));
+    return results;
 }));
 
 app.get('/', (req, res) => res.redirect('/manifest.json'));
