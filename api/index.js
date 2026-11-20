@@ -12,7 +12,7 @@ const ORIGIN = process.env.PUBLIC_URL || 'https://bilibili-addon.vercel.app';
 
 const manifest = {
     id: 'org.bilibilicustom.addon',
-    version: '1.5.0',
+    version: '1.5.1',
     name: 'Bilibili TV Addon',
     description: 'Katalog dan streaming dari Bilibili.tv',
     resources: ['catalog', 'meta', 'stream'],
@@ -354,6 +354,27 @@ app.get(/^\/dash\/(ep|av)\/(\d+)\.mpd$/, async (req, res) => {
         res.status(502).send('Gagal mengambil data: ' + e.message);
     }
 });
+
+
+// Coba satu video dengan beberapa locale / kualitas, laporkan kode tiap percobaan
+app.get('/debug/try/:kind/:num', wrap(async req => {
+    const { kind, num } = req.params;
+    const combos = [];
+    for (const loc of ['en_US', 'id_ID', 'th_TH', 'vi_VN', 'ms_MY']) {
+        for (const qn of [64, 32]) combos.push({ loc, qn });
+    }
+    return Promise.all(combos.map(async ({ loc, qn }) => {
+        try {
+            const params = { s_locale: loc, platform: 'web', qn, type: 0, device: 'wap', tf: 0 };
+            if (kind === 'av') params.aid = num; else params.ep_id = num;
+            const r = await http.get(`${BASE}/playurl`, { params, validateStatus: () => true });
+            const d = r.data || {};
+            return { loc, qn, http: r.status, code: d.code, message: d.message, hasVideo: !!(d.data && d.data.playurl && d.data.playurl.video) };
+        } catch (e) {
+            return { loc, qn, error: e.message };
+        }
+    }));
+}));
 
 app.get('/', (req, res) => res.redirect('/manifest.json'));
 app.use('/', getRouter(builder.getInterface()));
